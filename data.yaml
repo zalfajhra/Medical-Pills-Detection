@@ -1,0 +1,16 @@
+path: /content/dataset
+train: images/train
+val: images/val
+test: images/test
+nc: 10
+names:
+- Neozep
+- Biogesic
+- Fishoil
+- Medicol
+- Bactidol
+- Bioflu
+- Kremil S
+- Alaxan
+- Decolgen
+- DayZinc
