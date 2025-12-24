@@ -1,462 +1,290 @@
-import streamlit as st
-import cv2
-import numpy as np
-from PIL import Image
+from flask import Flask, render_template, request, jsonify, Response, send_from_directory, send_file
 from ultralytics import YOLO
-import tempfile
+import cv2
 import os
-from pathlib import Path
-import yaml
-import time
+from werkzeug.utils import secure_filename
+from datetime import datetime
+import numpy as np
+import base64
 
-# ============================================================================
-# KONFIGURASI HALAMAN
-# ============================================================================
-st.set_page_config(
-    page_title="Deteksi Obat & Vitamin",
-    page_icon="💊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+app = Flask(__name__)
 
-# ============================================================================
-# LOAD MODEL DAN KONFIGURASI
-# ============================================================================
-@st.cache_resource
-def load_model():
-    """Load YOLOv11 model"""
-    try:
-        model_path = "models/best.pt"
-        if not os.path.exists(model_path):
-            st.error(f"❌ Model tidak ditemukan di: {model_path}")
-            st.info("📥 Pastikan file 'best.pt' ada di folder 'models/'")
-            return None
-        
-        model = YOLO(model_path)
-        return model
-    except Exception as e:
-        st.error(f"❌ Error loading model: {str(e)}")
-        return None
+# Configuration
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['OUTPUT_FOLDER'] = 'outputs'
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max
+app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'mp4', 'avi', 'mov'}
 
-@st.cache_data
-def load_class_names():
-    """Load class names dari data.yaml"""
-    try:
-        with open('data.yaml', 'r') as f:
-            data = yaml.safe_load(f)
-            return data['names']
-    except Exception as e:
-        st.warning(f"⚠️ Tidak bisa load class names: {str(e)}")
-        return None
+# Create folders if not exist
+for folder in [app.config['UPLOAD_FOLDER'], app.config['OUTPUT_FOLDER']]:
+    os.makedirs(folder, exist_ok=True)
 
-# ============================================================================
-# FUNGSI UTILITAS
-# ============================================================================
-def create_folders():
-    """Buat folder yang dibutuhkan"""
-    os.makedirs("uploads", exist_ok=True)
-    os.makedirs("outputs", exist_ok=True)
-    os.makedirs("snapshots", exist_ok=True)
+# Load YOLO model
+MODEL_PATH = 'models/best.pt'
+model = YOLO(MODEL_PATH)
 
-def process_image(image, model, conf_threshold, iou_threshold):
-    """Proses deteksi pada gambar"""
-    try:
-        img_array = np.array(image)
-        results = model.predict(
-            source=img_array,
-            conf=conf_threshold,
-            iou=iou_threshold,
-            imgsz=640,
-            verbose=False
-        )
-        annotated_img = results[0].plot()
-        annotated_img = cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB)
-        return annotated_img, results[0]
-    except Exception as e:
-        st.error(f"❌ Error saat memproses gambar: {str(e)}")
-        return None, None
+# Get class names directly from the model
+# Ini akan mengambil nama class yang sebenarnya dari model yang sudah di-train
+CLASS_NAMES = list(model.names.values()) if hasattr(model, 'names') else [
+    'Alaxan', 'Biogesic', 'Decolgen', 'DayZinc', 'Medicol',
+    'Kremil S', 'Neozep', 'Fishoil', 'Bioflu', 'Bactidol'
+]
 
-def process_video_frames(video_path, model, conf_threshold, iou_threshold, progress_bar, status_text):
-    """Proses video dan simpan frame-by-frame"""
-    try:
-        cap = cv2.VideoCapture(video_path)
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        frames_dir = os.path.join("outputs", "frames")
-        os.makedirs(frames_dir, exist_ok=True)
-        
-        frame_count = 0
-        detection_summary = []
-        frame_paths = []
-        
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            results = model.predict(
-                source=frame,
-                conf=conf_threshold,
-                iou=iou_threshold,
-                imgsz=640,
-                verbose=False
-            )
-            
-            annotated_frame = results[0].plot()
-            frame_filename = os.path.join(frames_dir, f"frame_{frame_count:06d}.jpg")
-            cv2.imwrite(frame_filename, annotated_frame)
-            frame_paths.append(frame_filename)
-            
-            frame_count += 1
-            progress = frame_count / total_frames
-            progress_bar.progress(progress)
-            status_text.text(f"Memproses frame {frame_count}/{total_frames}")
-            
-            if len(results[0].boxes) > 0:
-                detection_summary.append({
-                    'frame': frame_count,
-                    'detections': len(results[0].boxes)
-                })
-        
-        cap.release()
-        
-        import imageio
-        output_path = os.path.join("outputs", "detected_video.mp4")
-        
-        status_text.text("📹 Menyusun video...")
-        writer = imageio.get_writer(output_path, fps=fps, codec='libx264', pixelformat='yuv420p')
-        
-        for frame_path in frame_paths:
-            frame = imageio.imread(frame_path)
-            writer.append_data(frame)
-        
-        writer.close()
-        
-        import shutil
-        shutil.rmtree(frames_dir)
-        
-        return output_path, detection_summary
+# Print class names for debugging
+print("="*50)
+print("Loaded model class names:")
+for idx, name in enumerate(CLASS_NAMES):
+    print(f"  Class {idx}: {name}")
+print("="*50)
+
+# Global variable for webcam
+camera = None
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+
+def detect_image(image_path):
+    """Detect objects in image"""
+    # Read original image
+    original_img = cv2.imread(image_path)
     
-    except Exception as e:
-        st.error(f"❌ Error saat memproses video: {str(e)}")
-        return None, None
-
-def display_detection_info(results, class_names):
-    """Tampilkan informasi deteksi"""
-    boxes = results.boxes
+    # Run detection
+    results = model(image_path)
     
-    if len(boxes) == 0:
-        st.warning("⚠️ Tidak ada objek yang terdeteksi")
-        return
+    # Get annotated image
+    annotated = results[0].plot()
     
-    st.success(f"✅ Terdeteksi {len(boxes)} objek!")
+    # Save both images
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    original_filename = f'original_{timestamp}.jpg'
+    detected_filename = f'detected_{timestamp}.jpg'
     
-    detection_data = []
-    for i, box in enumerate(boxes):
-        cls_id = int(box.cls[0])
-        conf = float(box.conf[0])
-        
-        if class_names and cls_id < len(class_names):
-            class_name = class_names[cls_id]
-        else:
-            class_name = f"Class {cls_id}"
-        
-        detection_data.append({
-            "No": i + 1,
-            "Obat/Vitamin": class_name,
-            "Confidence": f"{conf:.2%}"
+    original_path = os.path.join(app.config['OUTPUT_FOLDER'], original_filename)
+    detected_path = os.path.join(app.config['OUTPUT_FOLDER'], detected_filename)
+    
+    cv2.imwrite(original_path, original_img)
+    cv2.imwrite(detected_path, annotated)
+    
+    # Extract detection info - menggunakan dictionary untuk menghindari duplikat
+    unique_detections = {}
+    
+    for r in results:
+        boxes = r.boxes
+        if boxes is not None and len(boxes) > 0:
+            for box in boxes:
+                cls = int(box.cls[0])
+                conf = float(box.conf[0])
+                
+                # Get class name dari model, bukan dari list manual
+                class_name = r.names[cls] if cls in r.names else CLASS_NAMES[cls] if cls < len(CLASS_NAMES) else f'Class_{cls}'
+                
+                # Simpan hanya confidence tertinggi untuk setiap class
+                if class_name not in unique_detections or conf > unique_detections[class_name]:
+                    unique_detections[class_name] = conf
+    
+    # Convert ke list format
+    detections = []
+    for class_name, conf in unique_detections.items():
+        detections.append({
+            'class': class_name,
+            'confidence': round(conf * 100, 2)
         })
     
-    st.dataframe(detection_data, use_container_width=False)
+    # Sort by confidence
+    detections.sort(key=lambda x: x['confidence'], reverse=True)
     
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Total Deteksi", len(boxes))
-    with col2:
-        avg_conf = np.mean([float(box.conf[0]) for box in boxes])
-        st.metric("Rata-rata Confidence", f"{avg_conf:.2%}")
-    with col3:
-        unique_classes = len(set([int(box.cls[0]) for box in boxes]))
-        st.metric("Jenis Obat Berbeda", unique_classes)
+    return original_filename, detected_filename, detections
 
-# ============================================================================
-# MAIN APP
-# ============================================================================
-def main():
-    create_folders()
+def detect_video(video_path):
+    """Detect objects in video with H.264 codec for browser compatibility"""
+    cap = cv2.VideoCapture(video_path)
     
-    st.title("💊 Aplikasi Deteksi Obat & Vitamin")
-    st.markdown("---")
+    # Get video properties
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    if fps == 0:
+        fps = 30  # Default fallback
     
-    with st.sidebar:
-        st.header("⚙️ Pengaturan")
-        
-        with st.spinner("🔄 Loading model..."):
-            model = load_model()
-            class_names = load_class_names()
-        
-        if model is None:
-            st.stop()
-        
-        st.success("✅ Model berhasil dimuat!")
-        
-        if class_names:
-            st.info(f"📊 Jumlah kelas: {len(class_names)}")
-            with st.expander("📋 Daftar Kelas"):
-                for i, name in enumerate(class_names):
-                    st.text(f"{i+1}. {name}")
-        
-        st.markdown("---")
-        st.subheader("🎯 Pengaturan Deteksi")
-        
-        conf_threshold = st.slider(
-            "Confidence Threshold",
-            min_value=0.1,
-            max_value=1.0,
-            value=0.25,
-            step=0.05,
-            help="Semakin tinggi = lebih selektif"
-        )
-        
-        iou_threshold = st.slider(
-            "IOU Threshold",
-            min_value=0.1,
-            max_value=1.0,
-            value=0.45,
-            step=0.05,
-            help="Untuk menghilangkan duplikat deteksi"
-        )
-        
-        st.markdown("---")
-        st.markdown("### 📖 Cara Pakai:")
-        st.markdown("""
-        1. Pilih mode deteksi
-        2. Upload file atau capture webcam
-        3. Lihat hasil deteksi!
-        """)
+    # Output video with H.264 codec for browser compatibility
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_filename = f'detected_video_{timestamp}.mp4'
+    output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
     
-    tab1, tab2, tab3 = st.tabs(["📷 Deteksi Gambar", "🎬 Deteksi Video", "📹 Capture Webcam"])
+    # Use H.264 codec (avc1) which is widely supported by browsers
+    fourcc = cv2.VideoWriter_fourcc(*'avc1')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     
-    # TAB 1: DETEKSI GAMBAR
-    with tab1:
-        st.header("📷 Upload Gambar")
-        
-        uploaded_file = st.file_uploader(
-            "Pilih gambar obat/vitamin",
-            type=['jpg', 'jpeg', 'png'],
-            help="Format: JPG, JPEG, PNG",
-            key="image_uploader"
-        )
-        
-        if uploaded_file is not None:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.subheader("🖼️ Gambar Asli")
-                image = Image.open(uploaded_file)
-                st.image(image, use_column_width=True)
-            
-            if st.button("🔍 Mulai Deteksi", type="primary", use_container_width=True, key="detect_image"):
-                with st.spinner("🔄 Sedang memproses..."):
-                    annotated_img, results = process_image(
-                        image, model, conf_threshold, iou_threshold
-                    )
-                
-                if annotated_img is not None:
-                    with col2:
-                        st.subheader("✅ Hasil Deteksi")
-                        st.image(annotated_img, use_column_width=True)
-                    
-                    st.markdown("---")
-                    st.subheader("📊 Informasi Deteksi")
-                    display_detection_info(results, class_names)
-                    
-                    result_img = Image.fromarray(annotated_img)
-                    buf = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
-                    result_img.save(buf.name)
-                    
-                    with open(buf.name, 'rb') as f:
-                        st.download_button(
-                            label="📥 Download Hasil",
-                            data=f,
-                            file_name="detected_image.jpg",
-                            mime="image/jpeg",
-                            use_container_width=True
-                        )
+    frame_count = 0
+    # Dictionary to track unique detections per class
+    unique_detections = {}
     
-    # TAB 2: DETEKSI VIDEO
-    with tab2:
-        st.header("🎬 Upload Video")
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
         
-        uploaded_video = st.file_uploader(
-            "Pilih video obat/vitamin",
-            type=['mp4', 'avi', 'mov'],
-            help="Format: MP4, AVI, MOV",
-            key="video_uploader"
-        )
+        # Detect every frame
+        results = model(frame, verbose=False)
+        annotated = results[0].plot()
         
-        if uploaded_video is not None:
-            temp_video_path = os.path.join("uploads", "temp_video.mp4")
-            with open(temp_video_path, 'wb') as f:
-                f.write(uploaded_video.read())
-            
-            st.subheader("🎥 Video Asli")
-            st.video(temp_video_path)
-            
-            if st.button("🔍 Mulai Deteksi Video", type="primary", use_container_width=True, key="detect_video"):
-                st.markdown("---")
-                st.subheader("⏳ Memproses Video...")
-                
-                try:
-                    import imageio_ffmpeg
-                except ImportError:
-                    st.info("📦 Menginstall imageio-ffmpeg...")
-                    import subprocess
-                    subprocess.check_call(['pip', 'install', 'imageio-ffmpeg'])
-                    import imageio_ffmpeg
-                
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                output_path, detection_summary = process_video_frames(
-                    temp_video_path, model, conf_threshold, iou_threshold,
-                    progress_bar, status_text
-                )
-                
-                if output_path and os.path.exists(output_path):
-                    status_text.text("✅ Proses selesai!")
+        # Extract detections from current frame
+        for r in results:
+            boxes = r.boxes
+            if boxes is not None and len(boxes) > 0:
+                for box in boxes:
+                    cls = int(box.cls[0])
+                    conf = float(box.conf[0])
                     
-                    st.markdown("---")
-                    st.subheader("✅ Hasil Deteksi")
-                    st.video(output_path)
+                    # Get class name dari model
+                    class_name = r.names[cls] if cls in r.names else CLASS_NAMES[cls] if cls < len(CLASS_NAMES) else f'Class_{cls}'
                     
-                    if detection_summary:
-                        st.markdown("---")
-                        st.subheader("📊 Ringkasan Deteksi")
-                        
-                        total_detections = sum([d['detections'] for d in detection_summary])
-                        frames_with_detection = len(detection_summary)
-                        
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.metric("Total Deteksi", total_detections)
-                        with col2:
-                            st.metric("Frame dengan Deteksi", frames_with_detection)
+                    # Initialize if first time seeing this class
+                    if class_name not in unique_detections:
+                        unique_detections[class_name] = {
+                            'max_confidence': conf,
+                            'total_detections': 0
+                        }
                     
-                    with open(output_path, 'rb') as f:
-                        st.download_button(
-                            label="📥 Download Video Hasil",
-                            data=f,
-                            file_name="detected_video.mp4",
-                            mime="video/mp4",
-                            use_container_width=True
-                        )
-                else:
-                    st.error("❌ Gagal memproses video")
+                    # Update statistics
+                    unique_detections[class_name]['total_detections'] += 1
+                    if conf > unique_detections[class_name]['max_confidence']:
+                        unique_detections[class_name]['max_confidence'] = conf
+        
+        out.write(annotated)
+        frame_count += 1
     
-    # TAB 3: WEBCAM CAPTURE (SIMPLE)
-    with tab3:
-        st.header("📹 Capture dari Webcam")
-        
-        st.info("""
-        💡 **Cara Pakai:**
-        1. Klik tombol "📸 Capture dari Webcam"
-        2. Izinkan akses kamera ketika browser meminta
-        3. Ambil foto dengan klik tombol di kamera
-        4. Foto otomatis akan dideteksi!
-        """)
-        
-        st.markdown("---")
-        
-        # Streamlit camera input (native, no dependencies!)
-        camera_photo = st.camera_input("📸 Ambil foto dari webcam", key="webcam_capture")
-        
-        if camera_photo is not None:
-            # Convert to PIL Image
-            image = Image.open(camera_photo)
-            
-            st.markdown("---")
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.subheader("📷 Foto dari Webcam")
-                st.image(image, use_column_width=True)
-            
-            # Auto-detect
-            with st.spinner("🔄 Mendeteksi objek..."):
-                annotated_img, results = process_image(
-                    image, model, conf_threshold, iou_threshold
-                )
-            
-            if annotated_img is not None:
-                with col2:
-                    st.subheader("✅ Hasil Deteksi")
-                    st.image(annotated_img, use_column_width=True)
-                
-                st.markdown("---")
-                st.subheader("📊 Informasi Deteksi")
-                display_detection_info(results, class_names)
-                
-                # Save and download options
-                col_save, col_download = st.columns(2)
-                
-                with col_save:
-                    if st.button("💾 Simpan Snapshot", use_container_width=True):
-                        timestamp = time.strftime("%Y%m%d-%H%M%S")
-                        snapshot_path = os.path.join("snapshots", f"snapshot_{timestamp}.jpg")
-                        result_img = Image.fromarray(annotated_img)
-                        result_img.save(snapshot_path)
-                        st.success(f"✅ Snapshot disimpan: {snapshot_path}")
-                
-                with col_download:
-                    result_img = Image.fromarray(annotated_img)
-                    buf = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
-                    result_img.save(buf.name)
-                    
-                    with open(buf.name, 'rb') as f:
-                        st.download_button(
-                            label="📥 Download Hasil",
-                            data=f,
-                            file_name=f"webcam_detection_{time.strftime('%Y%m%d_%H%M%S')}.jpg",
-                            mime="image/jpeg",
-                            use_container_width=True
-                        )
-        
-        # Display saved snapshots
-        st.markdown("---")
-        st.subheader("📸 Snapshots Tersimpan")
-        
-        snapshot_files = sorted([f for f in os.listdir("snapshots") if f.endswith(('.jpg', '.jpeg', '.png'))])
-        
-        if len(snapshot_files) > 0:
-            st.info(f"Total snapshots: {len(snapshot_files)}")
-            
-            # Display last 6 snapshots
-            cols = st.columns(3)
-            for idx, snapshot_file in enumerate(snapshot_files[-6:][::-1]):
-                with cols[idx % 3]:
-                    snapshot_path = os.path.join("snapshots", snapshot_file)
-                    st.image(snapshot_path, caption=snapshot_file, use_column_width=True)
-                    
-                    # Delete button
-                    if st.button(f"🗑️ Hapus", key=f"delete_{snapshot_file}"):
-                        os.remove(snapshot_path)
-                        st.rerun()
-        else:
-            st.info("Belum ada snapshot tersimpan. Capture foto dari webcam untuk mulai!")
-        
-        st.markdown("---")
-        st.markdown("""
-        ### 💡 Tips untuk Hasil Terbaik:
-        - ✅ Pencahayaan cukup terang
-        - ✅ Tahan obat/vitamin dengan stabil
-        - ✅ Jarak ideal: 20-40 cm dari kamera
-        - ✅ Background polos untuk akurasi maksimal
-        - ✅ Fokus kamera jelas, tidak blur
-        """)
+    cap.release()
+    out.release()
+    
+    # Format detections for display - only include classes that were actually detected
+    total_detections = []
+    for class_name, stats in unique_detections.items():
+        total_detections.append({
+            'class': class_name,
+            'confidence': round(stats['max_confidence'] * 100, 2),
+            'count': stats['total_detections']
+        })
+    
+    # Sort by confidence (highest first)
+    total_detections.sort(key=lambda x: x['confidence'], reverse=True)
+    
+    return output_filename, total_detections, frame_count
 
-if __name__ == "__main__":
-    main()
+def generate_frames():
+    """Generate frames for webcam streaming"""
+    global camera
+    
+    if camera is None:
+        camera = cv2.VideoCapture(0)
+    
+    while True:
+        success, frame = camera.read()
+        if not success:
+            break
+        
+        # Detect objects
+        results = model(frame, verbose=False)
+        annotated = results[0].plot()
+        
+        # Encode frame
+        ret, buffer = cv2.imencode('.jpg', annotated)
+        frame = buffer.tobytes()
+        
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/upload_image', methods=['POST'])
+def upload_image():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+    
+    file = request.files['file']
+    
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"{timestamp}_{filename}"
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+        
+        # Detect
+        original_filename, detected_filename, detections = detect_image(filepath)
+        
+        return jsonify({
+            'success': True,
+            'original_image': f'/outputs/{original_filename}',
+            'output_image': f'/outputs/{detected_filename}',
+            'detections': detections,
+            'total_detected': len(detections),
+            'download_url': f'/download/{detected_filename}'
+        })
+    
+    return jsonify({'error': 'Invalid file format'}), 400
+
+@app.route('/upload_video', methods=['POST'])
+def upload_video():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+    
+    file = request.files['file']
+    
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"{timestamp}_{filename}"
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+        
+        # Detect
+        output_filename, detections, frame_count = detect_video(filepath)
+        
+        return jsonify({
+            'success': True,
+            'output_video': f'/outputs/{output_filename}',
+            'detections': detections,
+            'total_detected': len(detections),
+            'frames_processed': frame_count,
+            'download_url': f'/download/{output_filename}'
+        })
+    
+    return jsonify({'error': 'Invalid file format'}), 400
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/stop_webcam', methods=['POST'])
+def stop_webcam():
+    global camera
+    if camera is not None:
+        camera.release()
+        camera = None
+    return jsonify({'success': True})
+
+@app.route('/outputs/<filename>')
+def output_file(filename):
+    return send_from_directory(app.config['OUTPUT_FOLDER'], filename)
+
+@app.route('/download/<filename>')
+def download_file(filename):
+    """Download detection result"""
+    return send_file(
+        os.path.join(app.config['OUTPUT_FOLDER'], filename),
+        as_attachment=True,
+        download_name=filename
+    )
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)
